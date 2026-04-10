@@ -337,7 +337,12 @@
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn-sm accent" onclick="saveZohoCredentials()">Save &amp; Activate Auto-Refresh</button>
           <button class="btn-sm" onclick="refreshTokenNow()">↺ Refresh Now</button>
+          <button class="btn-sm" onclick="setupZohoRefreshFunction()" title="Create Supabase DB function for server-side token refresh">⚙ Setup DB Function</button>
           <button class="btn-sm danger" onclick="clearZohoCredentials()">Clear All</button>
+        </div>
+
+        <div style="margin-top:1rem;padding:10px 14px;background:var(--accent-light);border-radius:8px;font-size:12px;color:var(--accent);line-height:1.7">
+          <strong>One-time setup required:</strong> Click <strong>⚙ Setup DB Function</strong> once to install a Supabase server-side function. This lets the token refresh happen on Supabase's servers (no CORS). Run the SQL it shows in Supabase SQL Editor, then click <strong>↺ Refresh Now</strong>.
         </div>
 
         <div style="margin-top:1.25rem">
@@ -737,7 +742,124 @@ async function loadFAQsFromDB() {
 // ═══════════════════════════════════════════════
 //  ZOHO AUTO TOKEN REFRESH
 // ═══════════════════════════════════════════════
-const REFRESH_MS = 29 * 60 * 1000;
+// ═══════════════════════════════════════════════
+//  ZOHO TOKEN REFRESH — ALL IN ONE HTML
+//  Uses Supabase RPC (pg_net) as server-side proxy
+//  No external files needed
+// ═══════════════════════════════════════════════
+
+// The SQL to run once in Supabase to enable server-side token refresh
+const ZOHO_REFRESH_SQL = `
+-- Enable pg_net extension (allows HTTP calls from Supabase)
+CREATE EXTENSION IF NOT EXISTS pg_net;
+
+-- Create zoho_tokens table to store the latest access token
+CREATE TABLE IF NOT EXISTS zoho_tokens (
+  id           INTEGER PRIMARY KEY DEFAULT 1,
+  access_token TEXT NOT NULL DEFAULT '',
+  expires_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE zoho_tokens ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Public read" ON zoho_tokens;
+DROP POLICY IF EXISTS "Anon write" ON zoho_tokens;
+CREATE POLICY "Public read" ON zoho_tokens FOR SELECT USING (true);
+CREATE POLICY "Anon write" ON zoho_tokens FOR ALL USING (true) WITH CHECK (true);
+
+-- Insert default row
+INSERT INTO zoho_tokens (id, access_token, expires_at)
+VALUES (1, '', NOW())
+ON CONFLICT (id) DO NOTHING;
+
+-- Create the RPC function that calls Zoho and saves the token
+CREATE OR REPLACE FUNCTION refresh_zoho_token(
+  p_refresh_token TEXT,
+  p_client_id     TEXT,
+  p_client_secret TEXT
+) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_response      JSONB;
+  v_access_token  TEXT;
+  v_expires_in    INT;
+  v_request_id    BIGINT;
+  v_result        JSONB;
+BEGIN
+  -- Make HTTP POST to Zoho using pg_net
+  SELECT net.http_post(
+    url := 'https://accounts.zoho.in/oauth/v2/token',
+    headers := '{"Content-Type": "application/x-www-form-urlencoded"}'::JSONB,
+    body := ('grant_type=refresh_token&refresh_token=' || p_refresh_token ||
+             '&client_id=' || p_client_id ||
+             '&client_secret=' || p_client_secret)::TEXT
+  ) INTO v_request_id;
+
+  -- Wait briefly for response
+  PERFORM pg_sleep(2);
+
+  -- Get response
+  SELECT response_body::JSONB INTO v_response
+  FROM net._http_response
+  WHERE id = v_request_id;
+
+  IF v_response IS NULL THEN
+    RETURN jsonb_build_object('error', 'No response from Zoho');
+  END IF;
+
+  v_access_token := v_response->>'access_token';
+  v_expires_in   := COALESCE((v_response->>'expires_in')::INT, 3600);
+
+  IF v_access_token IS NULL THEN
+    RETURN jsonb_build_object('error', v_response->>'error', 'error_description', v_response->>'error_description');
+  END IF;
+
+  -- Save token to zoho_tokens table
+  INSERT INTO zoho_tokens (id, access_token, expires_at, updated_at)
+  VALUES (1, v_access_token, NOW() + (v_expires_in || ' seconds')::INTERVAL, NOW())
+  ON CONFLICT (id) DO UPDATE
+    SET access_token = EXCLUDED.access_token,
+        expires_at   = EXCLUDED.expires_at,
+        updated_at   = NOW();
+
+  RETURN jsonb_build_object(
+    'access_token', v_access_token,
+    'expires_in',   v_expires_in,
+    'saved',        true
+  );
+END;
+$$;`;
+
+function setupZohoRefreshFunction() {
+  // Show the SQL in a modal for the user to copy and run
+  const existing = document.getElementById('setup-sql-modal');
+  if (existing) existing.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'setup-sql-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:1rem';
+  modal.innerHTML = `
+    <div style="background:var(--surface);border-radius:16px;padding:2rem;width:100%;max-width:680px;border:1px solid var(--border);max-height:90vh;overflow-y:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+        <div style="font-family:'DM Serif Display',serif;font-size:18px">Setup Supabase DB Function</div>
+        <button onclick="document.getElementById('setup-sql-modal').remove()" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:13px">✕ Close</button>
+      </div>
+      <div style="font-size:13px;color:var(--ink2);margin-bottom:1rem;line-height:1.6">
+        Run this SQL <strong>once</strong> in your Supabase Dashboard → SQL Editor. It installs a server-side function that refreshes your Zoho token without any CORS issues.
+      </div>
+      <pre id="setup-sql-pre" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-size:11px;overflow:auto;white-space:pre-wrap;color:var(--ink2);max-height:360px">${ZOHO_REFRESH_SQL.trim()}</pre>
+      <div style="display:flex;gap:8px;margin-top:1rem">
+        <button onclick="copySql()" class="btn-sm accent" style="flex:1">Copy SQL</button>
+        <a href="https://supabase.com/dashboard/project/lrccotdkoptqwehvsbvk/sql/new" target="_blank" class="btn-sm" style="flex:1;text-align:center;text-decoration:none">Open SQL Editor ↗</a>
+      </div>
+      <div style="margin-top:10px;font-size:11px;color:var(--ink3)">After running the SQL, come back and click <strong>↺ Refresh Now</strong> — the token will be generated and saved to Supabase automatically.</div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+function copySql() {
+  navigator.clipboard.writeText(ZOHO_REFRESH_SQL.trim())
+    .then(() => toast('SQL copied to clipboard!'))
+    .catch(() => toast('Copy failed — please select and copy manually.'));
+}
 let tokenRefreshTimer=null, timerTickInterval=null;
 
 function getZohoCreds(){
@@ -750,47 +872,107 @@ function getZohoCreds(){
   };
 }
 
+const REFRESH_MS = 29 * 60 * 1000;
+
 async function refreshTokenNow(){
   const btn=document.getElementById('refresh-now-btn');
-  const {refreshToken,clientId,clientSecret,accountsUrl}=getZohoCreds();
+  const {refreshToken,clientId,clientSecret}=getZohoCreds();
   if(!refreshToken||!clientId||!clientSecret){
-    toast('Enter Refresh Token, Client ID and Secret in API & Database settings.');
+    toast('Enter Refresh Token, Client ID and Secret first.');
     switchTab('settings'); return;
   }
   btn.disabled=true; btn.textContent='↺ Refreshing…';
-  addLog('Requesting new access token from Zoho…','info');
-  try {
+  addLog('Requesting new access token…','info');
+
+  // Strategy 1: Supabase RPC using pg_net (server-side, no CORS, works everywhere)
+  if(SB_URL && SB_KEY){
+    try{
+      const res=await fetch(`${SB_URL}/rest/v1/rpc/refresh_zoho_token`,{
+        method:'POST',
+        headers:{
+          'apikey':SB_KEY,
+          'Authorization':`Bearer ${SB_KEY}`,
+          'Content-Type':'application/json'
+        },
+        body:JSON.stringify({
+          p_refresh_token: refreshToken,
+          p_client_id:     clientId,
+          p_client_secret: clientSecret
+        })
+      });
+      const data=await res.json();
+      if(data && data.access_token){
+        await saveAccessToken(data.access_token, data.expires_in||3600);
+        addLog(`Token refreshed via Supabase RPC. Expires ${Math.round((data.expires_in||3600)/60)} min. Saved to DB ✓`,'ok');
+        toast('Token refreshed & saved to Supabase.');
+        btn.disabled=false; btn.textContent='↺ Refresh Token';
+        return;
+      } else if(data && data.error){
+        addLog(`Zoho error via RPC: ${data.error}`,'err');
+      } else {
+        addLog('RPC function not found — click ⚙ Setup DB Function first.','err');
+      }
+    } catch(e){ addLog(`Supabase RPC error: ${e.message}`,'err'); }
+  }
+
+  // Strategy 2: Vercel proxy /api/refresh-token (works when hosted on Vercel)
+  const onVercel = window.location.hostname!=='localhost' && window.location.protocol!=='file:';
+  if(onVercel){
+    try{
+      const res=await fetch('/api/refresh-token',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          refresh_token:refreshToken,
+          client_id:clientId,
+          client_secret:clientSecret,
+          sb_url:SB_URL,
+          sb_key:SB_KEY
+        })
+      });
+      const data=await res.json();
+      if(data.access_token){
+        await saveAccessToken(data.access_token, data.expires_in||3600);
+        addLog(`Token refreshed via Vercel proxy. Expires ${Math.round((data.expires_in||3600)/60)} min.`,'ok');
+        toast('Access token refreshed & saved to Supabase.');
+        btn.disabled=false; btn.textContent='↺ Refresh Token';
+        return;
+      } else {
+        addLog(`Zoho error: ${data.error} — ${data.error_description||''}`,'err');
+        setZohoStatus('off','Refresh failed');
+        toast(`Token refresh failed: ${data.error}`);
+        btn.disabled=false; btn.textContent='↺ Refresh Token';
+        return;
+      }
+    } catch(e){ addLog(`Vercel proxy error: ${e.message}. Trying fallback…`,'err'); }
+  }
+
+  // Strategy 3: Direct call (may work if Zoho allows CORS for this domain)
+  try{
     const params=new URLSearchParams({
       grant_type:'refresh_token',
       refresh_token:refreshToken,
       client_id:clientId,
       client_secret:clientSecret
     });
-    const res=await fetch(`${accountsUrl}/oauth/v2/token`,{
+    const res=await fetch('https://accounts.zoho.in/oauth/v2/token',{
       method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
       body:params.toString()
     });
     const data=await res.json();
     if(data.access_token){
-      LS.set('zoho_access_token',data.access_token);
-      const exp=Date.now()+((data.expires_in||3600)*1000);
-      LS.set('zoho_token_expires_at',exp.toString());
-      updateAccessTokenPreview(data.access_token);
-      setZohoStatus('ok','Token active');
-      scheduleNextRefresh();
-      addLog(`Token refreshed. Expires in ${Math.round((data.expires_in||3600)/60)} min.`,'ok');
+      await saveAccessToken(data.access_token, data.expires_in||3600);
+      addLog(`Token refreshed directly. Expires ${Math.round((data.expires_in||3600)/60)} min.`,'ok');
       toast('Access token refreshed.');
-    } else {
-      addLog(`Error: ${data.error} — ${data.error_description||''}`,'err');
-      setZohoStatus('off','Refresh failed');
-      toast(`Token refresh failed: ${data.error}`);
+      btn.disabled=false; btn.textContent='↺ Refresh Token';
+      return;
     }
-  } catch(e){
-    addLog(`Network error: ${e.message}`,'err');
-    setZohoStatus('warn','Network error');
-    toast('Network error during token refresh.');
-  }
+  } catch(e){ addLog(`Direct call blocked (CORS): ${e.message}`,'err'); }
+
+  // Strategy 4: Manual fallback
+  addLog('Auto-refresh unavailable. Please enter token manually below.','err');
+  showManualTokenBox(refreshToken, clientId, clientSecret);
   btn.disabled=false; btn.textContent='↺ Refresh Token';
 }
 
@@ -839,7 +1021,75 @@ function addLog(msg,type='info'){
   while(log.children.length>25) log.removeChild(log.lastChild);
 }
 
-function updateAccessTokenPreview(token){
+async function saveAccessToken(token, expiresIn){
+  LS.set('zoho_access_token', token);
+  const exp = Date.now()+((expiresIn||3600)*1000);
+  LS.set('zoho_token_expires_at', exp.toString());
+  updateAccessTokenPreview(token);
+  setZohoStatus('ok','Token active');
+  scheduleNextRefresh();
+
+  // Also save to Supabase so faq.html always gets the latest token
+  if(SB_URL && SB_KEY){
+    try{
+      const expires_at = new Date(exp).toISOString();
+      const row = {id:1, access_token:token, expires_at, updated_at:new Date().toISOString()};
+      const headers = {
+        'apikey':SB_KEY,'Authorization':`Bearer ${SB_KEY}`,
+        'Content-Type':'application/json','Prefer':'return=minimal'
+      };
+      const patch = await fetch(`${SB_URL}/rest/v1/zoho_tokens?id=eq.1`,{method:'PATCH',headers,body:JSON.stringify(row)});
+      if(patch.status===404||patch.status===406){
+        await fetch(`${SB_URL}/rest/v1/zoho_tokens`,{method:'POST',headers,body:JSON.stringify(row)});
+      }
+      addLog('Token saved to Supabase ✓','ok');
+    } catch(e){
+      addLog(`Supabase save failed: ${e.message}`,'err');
+    }
+  }
+}
+
+function showManualTokenBox(rt, ci, cs){
+  // Remove existing box if any
+  const existing = document.getElementById('manual-token-box');
+  if(existing) existing.remove();
+
+  // Build the curl command so user can run it in terminal
+  const curlCmd = `curl -X POST https://accounts.zoho.in/oauth/v2/token \\\n  -d "grant_type=refresh_token" \\\n  -d "refresh_token=${rt}" \\\n  -d "client_id=${ci}" \\\n  -d "client_secret=${cs}"`;
+
+  const box = document.createElement('div');
+  box.id = 'manual-token-box';
+  box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:1rem';
+  box.innerHTML = `
+    <div style="background:var(--surface);border-radius:16px;padding:2rem;width:100%;max-width:580px;border:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.25rem">
+        <div style="font-family:'DM Serif Display',serif;font-size:18px">Paste Access Token</div>
+        <div onclick="document.getElementById('manual-token-box').remove()" style="cursor:pointer;font-size:20px;color:var(--ink3)">✕</div>
+      </div>
+      <p style="font-size:13px;color:var(--ink2);margin-bottom:1rem;line-height:1.7">
+        Since the browser blocks direct Zoho calls, run this command in your <strong>terminal / command prompt</strong> to get a fresh access token, then paste it below:
+      </p>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:11px;color:var(--ink2);white-space:pre;overflow:auto;margin-bottom:1rem">${curlCmd}</div>
+      <button onclick="navigator.clipboard.writeText(\`${curlCmd.replace(/\\/g,'\\\\')}\`).then(()=>alert('Copied!'))" style="font-size:12px;padding:6px 14px;border:1.5px solid var(--border);border-radius:7px;background:var(--bg);cursor:pointer;margin-bottom:1.25rem;font-family:'DM Sans',sans-serif">Copy Command</button>
+      <label style="font-size:11px;font-weight:500;color:var(--ink3);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:6px">Paste access_token value here</label>
+      <input id="manual-at-input" type="text" placeholder="Paste the access_token value from the response…"
+        style="width:100%;padding:10px 12px;font-size:13px;font-family:'DM Sans',sans-serif;border:1.5px solid var(--border);border-radius:8px;background:var(--bg);color:var(--ink);outline:none;margin-bottom:1rem">
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button onclick="document.getElementById('manual-token-box').remove()" style="padding:9px 16px;font-size:13px;font-family:'DM Sans',sans-serif;border:1.5px solid var(--border);border-radius:8px;background:var(--surface);cursor:pointer">Cancel</button>
+        <button onclick="applyManualToken()" style="padding:9px 16px;font-size:13px;font-family:'DM Sans',sans-serif;border:none;border-radius:8px;background:var(--accent);color:white;cursor:pointer;font-weight:500">Save Token</button>
+      </div>
+    </div>`;
+  document.body.appendChild(box);
+}
+
+function applyManualToken(){
+  const val = document.getElementById('manual-at-input').value.trim();
+  if(!val){ toast('Paste the access token first.'); return; }
+  saveAccessToken(val, 3600);
+  document.getElementById('manual-token-box').remove();
+  addLog('Manual access token saved. Valid for ~1 hour.','ok');
+  toast('Access token saved successfully.');
+}
   const el=document.getElementById('access-token-preview');
   el.textContent=token ? token.substring(0,12)+'•••••••••••••••••••••'+token.slice(-8) : 'Not generated yet';
 }
