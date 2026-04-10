@@ -464,882 +464,211 @@
 <div class="toast" id="toast"></div>
 
 <script>
-// ═══════════════════════════════════════════════
-//  AUTH
-// ═══════════════════════════════════════════════
-const CREDS = { username:'admin', password:'admin123' };
-function doLogin() {
-  const u = document.getElementById('login-user').value.trim();
-  const p = document.getElementById('login-pass').value;
-  const err = document.getElementById('login-error');
-  if (u===CREDS.username && p===CREDS.password) {
-    err.style.display='none';
-    document.getElementById('login-screen').style.display='none';
-    document.getElementById('admin-shell').style.display='block';
-    init();
-  } else { err.style.display='block'; }
-}
-function doLogout() {
-  stopTimers();
-  document.getElementById('login-screen').style.display='flex';
-  document.getElementById('admin-shell').style.display='none';
-}
-
-// ═══════════════════════════════════════════════
-//  STORAGE HELPERS
+  // ═══════════════════════════════════════════════
+//  STORAGE & STATE
 // ═══════════════════════════════════════════════
 const LS = {
-  get:     k => { try { return localStorage.getItem(k); } catch(e){return null} },
-  set:     (k,v) => { try { localStorage.setItem(k,v); } catch(e){} },
-  del:     k => { try { localStorage.removeItem(k); } catch(e){} },
-  getJSON: k => { try { const v=localStorage.getItem(k); return v?JSON.parse(v):null; } catch(e){return null} },
-  setJSON: (k,v) => { try { localStorage.setItem(k,JSON.stringify(v)); } catch(e){} }
+  get: k => localStorage.getItem(k),
+  set: (k, v) => localStorage.setItem(k, v),
+  getJSON: k => JSON.parse(localStorage.getItem(k) || 'null'),
+  setJSON: (k, v) => localStorage.setItem(k, JSON.stringify(v))
 };
 
-// ═══════════════════════════════════════════════
-//  SUPABASE
-// ═══════════════════════════════════════════════
-let SB_URL='', SB_KEY='';
+let articles = [];
+let tokenTimerInterval;
 
-async function sbFetch(path, opts={}) {
-  if (!SB_URL||!SB_KEY) throw new Error('Supabase not configured');
+// ═══════════════════════════════════════════════
+//  SUPABASE CORE
+// ═══════════════════════════════════════════════
+async function sbFetch(path, opts = {}) {
+  const url = LS.get('sb-url');
+  const key = LS.get('sb-key');
+  if (!url || !key) throw new Error('Supabase not configured');
+
   const headers = {
-    'apikey': SB_KEY,
-    'Authorization': `Bearer ${SB_KEY}`,
+    'apikey': key,
+    'Authorization': `Bearer ${key}`,
     'Content-Type': 'application/json',
-    ...( opts.headers||{} )
+    'Prefer': 'return=representation',
+    ...(opts.headers || {})
   };
-  if (!headers['Prefer'] && opts.method && opts.method!=='GET') headers['Prefer']='return=representation';
-  const res = await fetch(`${SB_URL}/rest/v1/${path}`, { ...opts, headers });
-  if (!res.ok) { const t=await res.text(); throw new Error(`${res.status}: ${t}`); }
-  const ct = res.headers.get('content-type')||'';
-  return ct.includes('json') ? res.json() : null;
+
+  const res = await fetch(`${url}/rest/v1/${path}`, { ...opts, headers });
+  if (!res.ok) throw new Error(await res.text());
+  return res.status !== 204 ? res.json() : null;
 }
 
-async function saveAndTestSupabase() {
-  let url = document.getElementById('sb-url').value.trim();
-  const key = document.getElementById('sb-key').value.trim();
+async function init() {
+  loadConfig();
+  await refreshData();
+  startTokenTimer();
+}
 
-  // ── strict URL validation ──────────────────────────────────────
-  // Remove trailing slashes and any accidental path segments
-  url = url.replace(/\/+$/, '');
-
-  // Must start with https:// and contain supabase.co or supabase.net
-  const urlPattern = /^https:\/\/[a-zA-Z0-9_-]+\.supabase\.(co|net)(\/)?$/;
-  if (!url.startsWith('https://') || !url.includes('supabase.')) {
-    setSyncBar('error', 'Invalid Project URL. Must be: https://xxxx.supabase.co — copy it from Supabase → Settings → General.');
-    setSbStatus('off', 'Invalid URL');
-    toast('Fix the Project URL — see hint below.');
-    showUrlFormatHint(url);
-    return;
-  }
-  if (!key || key.length < 20) {
-    setSyncBar('error', 'Anon key looks too short. Copy the full "Publishable key" from Supabase → Settings → API Keys.');
-    toast('Check your key.');
-    return;
-  }
-  if (key.includes('supabase.co') || key.includes('http')) {
-    setSyncBar('error', 'It looks like you pasted the URL into the Key field. Please check both fields.');
-    toast('Key field contains a URL — please fix.');
-    return;
-  }
-  // Accept both old JWT format (eyJ...) and new Supabase publishable key format (sb_publishable_...)
-  const validKey = key.startsWith('eyJ') || key.startsWith('sb_publishable_') || key.startsWith('sb_secret_');
-  if (!validKey) {
-    setSyncBar('error', 'Key format not recognised. Use the anon/public key (starts with eyJ...) from Supabase → Settings → API.');
-    toast('Unrecognised key format.');
-    return;
-  }
-
-  setSyncBar('syncing', `Connecting to ${url} …`);
-  setSB_URL_KEY(url, key);
+async function refreshData() {
+  const syncMsg = document.getElementById('sync-msg');
+  const syncSpin = document.getElementById('sync-spin');
+  syncSpin.style.display = 'block';
+  syncMsg.innerText = "Syncing with Supabase...";
 
   try {
-    // Use a direct fetch with no sbFetch wrapper so URL is guaranteed clean
-    const testRes = await fetch(`${url}/rest/v1/faqs?select=id&limit=1`, {
-      method: 'GET',
-      headers: {
-        'apikey': key,
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (testRes.status === 404) {
-      // Table might not exist yet — that's OK, connection itself worked
-      LS.set('sb_url', url); LS.set('sb_key', key);
-      setSbStatus('ok', 'Connected (table not yet created)');
-      setSyncBar('warn', 'Connected! The faqs table does not exist yet — click Create Table to set it up.');
-      toast('Supabase connected. Now click Create Table.');
-      updateSettingsAlert();
-      return;
-    }
-
-    if (!testRes.ok && testRes.status !== 200) {
-      const body = await testRes.text();
-      // 401 = bad key
-      if (testRes.status === 401) throw new Error('Invalid anon key — check Supabase → Settings → API → anon public key.');
-      throw new Error(`HTTP ${testRes.status}: ${body.substring(0, 200)}`);
-    }
-
-    LS.set('sb_url', url); LS.set('sb_key', key);
-    setSbStatus('ok', 'Connected');
-    setSyncBar('success', `Connected to Supabase. Last tested: ${new Date().toLocaleTimeString()}`);
-    toast('Supabase connected!');
-    updateSettingsAlert();
-    await loadFAQsFromDB();
-
-  } catch(e) {
-    setSB_URL_KEY('', '');
-    setSbStatus('off', 'Failed');
-    setSyncBar('error', `Connection error: ${e.message}`);
-    toast('Connection failed — see error in sync bar.');
+    articles = await sbFetch('faq_articles?select=*&order=created_at.desc');
+    renderTable();
+    syncMsg.innerText = "All systems synced";
+    document.getElementById('sync-bar').className = "sync-bar success";
+  } catch (e) {
+    syncMsg.innerText = "Sync Error: " + e.message;
+    document.getElementById('sync-bar').className = "sync-bar error";
+  } finally {
+    syncSpin.style.display = 'none';
   }
-}
-
-function setSB_URL_KEY(url, key) { SB_URL = url; SB_KEY = key; }
-
-function showUrlFormatHint(bad) {
-  // Show what was entered vs what is expected
-  const wrap = document.getElementById('url-format-hint');
-  const box = wrap || document.createElement('div');
-  box.id = 'url-format-hint';
-  box.style.cssText = 'margin-top:10px;padding:10px 14px;background:var(--red-light);border:1px solid #f5c6c6;border-radius:8px;font-size:12px;color:var(--red);line-height:1.7';
-  box.innerHTML = `<strong>What you entered:</strong> <code style="word-break:break-all">${bad||'(empty)'}</code><br>
-    <strong>What it should look like:</strong> <code>https://abcdefghijklmn.supabase.co</code><br>
-    Go to <strong>Supabase Dashboard → Settings → API → Project URL</strong> and copy just that value.`;
-  if (!wrap) document.querySelector('#tab-settings .settings-card').appendChild(box);
-}
-
-const MIGRATION_SQL = `-- Run in Supabase Dashboard → SQL Editor
-
-CREATE TABLE IF NOT EXISTS faqs (
-  id         BIGSERIAL PRIMARY KEY,
-  topic      TEXT NOT NULL DEFAULT 'leads',
-  role       TEXT NOT NULL DEFAULT 'both',
-  question   TEXT NOT NULL,
-  answer     TEXT NOT NULL,
-  photo      TEXT DEFAULT '',
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Enable Row Level Security
-ALTER TABLE faqs ENABLE ROW LEVEL SECURITY;
-
--- Allow public read
-CREATE POLICY "Public read" ON faqs FOR SELECT USING (true);
-
--- Allow anon write (admin only in practice via this panel)
-CREATE POLICY "Anon all" ON faqs FOR ALL USING (true) WITH CHECK (true);`;
-
-async function runSupabaseMigration() {
-  if (!SB_URL||!SB_KEY) { toast('Connect Supabase first.'); return; }
-  setSyncBar('syncing','Creating faqs table…');
-  try {
-    // Try the rpc/query approach (requires pg_net or exec_sql extension)
-    const res = await fetch(`${SB_URL}/rest/v1/rpc/exec_sql`, {
-      method:'POST',
-      headers:{'apikey':SB_KEY,'Authorization':`Bearer ${SB_KEY}`,'Content-Type':'application/json'},
-      body: JSON.stringify({ query: MIGRATION_SQL })
-    });
-    if (res.ok) {
-      setSyncBar('success','Table created! Now click Save & Test to reload.');
-      toast('faqs table created.');
-    } else { throw new Error('rpc not available'); }
-  } catch(e) {
-    // Fallback: show SQL to copy
-    setSyncBar('warn','Auto-create unavailable — copy the SQL below and run it in Supabase.');
-    document.getElementById('migration-sql-wrap').style.display='block';
-    document.getElementById('migration-sql-box').textContent = MIGRATION_SQL;
-  }
-}
-
-async function forceSyncToSupabase() {
-  if (!SB_URL||!SB_KEY) { toast('Connect Supabase first.'); return; }
-  if (!confirm('This will delete all Supabase data and re-insert from local. Continue?')) return;
-  setSyncBar('syncing',`Pushing ${faqs.length} articles to Supabase…`);
-  try {
-    // Delete all first to avoid conflicts
-    await sbFetch('faqs?id=gt.0',{method:'DELETE',headers:{'Prefer':'return=minimal'}});
-    // Re-insert without IDs
-    const rows = faqs.map(f=>({topic:f.topic,role:f.role,question:f.q,answer:f.a,photo:f.photo||''}));
-    await sbFetch('faqs',{method:'POST',body:JSON.stringify(rows),headers:{'Prefer':'return=minimal'}});
-    setSyncBar('success',`Pushed ${faqs.length} articles to Supabase.`);
-    toast('Sync complete.');
-    await loadFAQsFromDB();
-  } catch(e) { setSyncBar('error',`Sync failed: ${e.message}`); }
-}
-
-function setSbStatus(s,t) {
-  document.getElementById('sb-status-pill').className=`status-pill ${s}`;
-  document.getElementById('sb-dot').className=`sdot ${s}`;
-  document.getElementById('sb-status-text').textContent=t;
-}
-function setSyncBar(state,msg) {
-  document.getElementById('sync-bar').className=`sync-bar ${state}`;
-  document.getElementById('sync-spin').style.display=state==='syncing'?'block':'none';
-  document.getElementById('sync-msg').textContent=msg;
 }
 
 // ═══════════════════════════════════════════════
-//  FAQ DATA
+//  TABLE RENDERING
 // ═══════════════════════════════════════════════
-const DEFAULT_FAQS = [
-  {id:1,topic:"leads",role:"both",question:"How do I add a new lead in Zoho CRM?",answer:`<p>Go to <code>Leads</code> in the top navigation bar, then click <strong>+ New Lead</strong>. Fill in required fields (marked with *) and click <strong>Save</strong>.</p><ul><li>Required fields: Last Name, Company, Lead Source</li><li>Import in bulk via <code>Leads → Import</code></li></ul><div class="tip">Always check for duplicates before creating a new lead using <em>Find & Merge Duplicates</em>.</div>`,photo:""},
-  {id:2,topic:"leads",role:"agent",question:"How do I convert a lead to a contact or deal?",answer:`<p>Open the lead record, click <strong>Convert</strong> at the top. You'll be prompted to create a Contact, Account, and/or Deal.</p><ul><li>Existing fields auto-map to the new records</li><li>The original lead is marked as <em>Converted</em></li></ul>`,photo:""},
-  {id:3,topic:"leads",role:"agent",question:"How do I assign a lead to myself or another agent?",answer:`<p>Open the lead record and find the <strong>Lead Owner</strong> field. Click the pencil icon and select the desired user.</p><div class="tip">Use <code>Leads → Mass Update</code> to reassign multiple leads at once.</div>`,photo:""},
-  {id:4,topic:"leads",role:"lead",question:"How do I reassign leads in bulk across the team?",answer:`<p>Go to <code>Leads</code>, select records via checkboxes, then click <strong>Actions → Mass Update</strong> and change the <em>Lead Owner</em> field.</p>`,photo:""},
-  {id:5,topic:"leads",role:"both",question:"How do I search for a specific contact or lead?",answer:`<p>Use the <strong>global search bar</strong> (magnifying glass icon) at the top. For precise results, use <strong>Advanced Search</strong> inside the module.</p>`,photo:""},
-  {id:6,topic:"users",role:"lead",question:"How do I add a new user to our CRM?",answer:`<p>Go to <code>Setup → Users & Control → Users</code> and click <strong>+ New User</strong>. Enter name, email, role, and profile, then save.</p><div class="tip">Set the correct Role and Profile before saving.</div>`,photo:""},
-  {id:7,topic:"users",role:"lead",question:"What is the difference between a Role and a Profile?",answer:`<p><strong>Profile</strong> — controls what a user <em>can do</em>.</p><p><strong>Role</strong> — controls what data a user <em>can see</em> based on hierarchy.</p>`,photo:""},
-  {id:8,topic:"data",role:"both",question:"How do I log a call, email, or note on a record?",answer:`<p>Open the lead or contact, scroll to <strong>Activities / Timeline</strong> and click Log a Call, Send Email, or Add Note.</p><div class="tip">Always log interactions to prevent double-outreach.</div>`,photo:""},
-  {id:9,topic:"data",role:"lead",question:"How do I create or customise a field in a module?",answer:`<p>Go to <code>Setup → Customization → Modules & Fields</code>, select the module, click <strong>Fields → + New Field</strong>. Choose field type, configure it, save, and drag to position.</p>`,photo:""},
-  {id:10,topic:"data",role:"both",question:"How do I export data from Zoho CRM?",answer:`<p>Go to the module, click <strong>Actions → Export</strong>. Choose fields and format (CSV or XLS).</p>`,photo:""},
-];
+function renderTable() {
+  const tbody = document.getElementById('faq-tbody');
+  const search = document.getElementById('admin-search').value.toLowerCase();
+  const roleFilt = document.getElementById('filter-role').value;
+  const topicFilt = document.getElementById('filter-topic').value;
 
-let faqs=[], editingId=null;
+  const filtered = articles.filter(a => {
+    const matchSearch = a.question.toLowerCase().includes(search);
+    const matchRole = !roleFilt || a.role === roleFilt;
+    const matchTopic = !topicFilt || a.topic === topicFilt;
+    return matchSearch && matchRole && matchTopic;
+  });
 
-function rowToFaq(r){ return {id:r.id,topic:r.topic,role:r.role,q:r.question,a:r.answer,photo:r.photo||''}; }
-function faqToRow(f){ 
-  // Never include id — let Supabase BIGSERIAL auto-generate
-  return {topic:f.topic, role:f.role, question:f.q, answer:f.a, photo:f.photo||''}; 
+  tbody.innerHTML = filtered.map(a => `
+    <tr>
+      <td>${a.photo_url ? `<img src="${a.photo_url}" class="thumb">` : `<div class="no-thumb">?</div>`}</td>
+      <td class="td-question"><strong>${a.question}</strong></td>
+      <td><span class="topic-pill">${a.topic}</span></td>
+      <td><span class="role-pill pill-${a.role}">${a.role}</span></td>
+      <td class="td-actions">
+        <button class="btn-icon" onclick="openModal('${a.id}')">Edit</button>
+        <button class="btn-icon del" onclick="deleteArticle('${a.id}')">Delete</button>
+      </td>
+    </tr>
+  `).join('');
 }
 
-function syncToLocalStorage(){
-  LS.setJSON('zoho_faqs', faqs.map(f=>({id:f.id,topic:f.topic,role:f.role,q:f.q,a:f.a,photo:f.photo})));
-}
+// ═══════════════════════════════════════════════
+//  ARTICLE ACTIONS
+// ═══════════════════════════════════════════════
+async function saveArticle() {
+  const id = document.getElementById('edit-id').value;
+  const payload = {
+    question: document.getElementById('f-question').value,
+    answer: document.getElementById('f-answer').value,
+    topic: document.getElementById('f-topic').value,
+    role: document.getElementById('f-role').value,
+    photo_url: document.getElementById('f-photo-url').value
+  };
 
-async function loadFAQsFromDB() {
-  if (!SB_URL||!SB_KEY) {
-    faqs=(LS.getJSON('zoho_faqs')||DEFAULT_FAQS).map(f=>({id:f.id,topic:f.topic,role:f.role,q:f.question||f.q,a:f.answer||f.a,photo:f.photo||''}));
-    setSyncBar('warn','Supabase not configured — using local storage. Go to API & Database tab to connect.');
-    renderSummary(); renderTable();
-    return;
-  }
-  setSyncBar('syncing','Loading FAQs from Supabase…');
   try {
-    const rows = await sbFetch('faqs?select=*&order=id.asc',{headers:{'Prefer':''}});
-    if (!rows||rows.length===0) {
-      setSyncBar('syncing','No data found — seeding defaults…');
-      const insertRows = DEFAULT_FAQS.map(f=>({topic:f.topic,role:f.role,question:f.question||f.q,answer:f.answer||f.a,photo:f.photo||''}));
-      const inserted = await sbFetch('faqs',{method:'POST',body:JSON.stringify(insertRows)});
-      faqs=(inserted||[]).map(rowToFaq);
-      if(!faqs.length) faqs=DEFAULT_FAQS.map(f=>({...f,q:f.question||f.q,a:f.answer||f.a}));
+    if (id) {
+      await sbFetch(`faq_articles?id=eq.${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
     } else {
-      faqs=rows.map(rowToFaq);
+      await sbFetch('faq_articles', { method: 'POST', body: JSON.stringify(payload) });
     }
-    syncToLocalStorage();
-    setSyncBar('success',`${faqs.length} articles loaded from Supabase · ${new Date().toLocaleTimeString()}`);
-    renderSummary(); renderTable();
-  } catch(e) {
-    setSyncBar('error',`Supabase error: ${e.message} — using local fallback.`);
-    faqs=(LS.getJSON('zoho_faqs')||DEFAULT_FAQS).map(f=>({id:f.id,topic:f.topic,role:f.role,q:f.question||f.q,a:f.answer||f.a,photo:f.photo||''}));
-    renderSummary(); renderTable();
+    closeModal();
+    refreshData();
+    showToast("Article Saved");
+  } catch (e) {
+    alert("Save failed: " + e.message);
+  }
+}
+
+async function deleteArticle(id) {
+  if (!confirm("Delete this article?")) return;
+  try {
+    await sbFetch(`faq_articles?id=eq.${id}`, { method: 'DELETE' });
+    refreshData();
+    showToast("Article Deleted");
+  } catch (e) {
+    alert("Delete failed");
   }
 }
 
 // ═══════════════════════════════════════════════
-//  ZOHO AUTO TOKEN REFRESH
+//  ZOHO TOKEN REFRESH LOGIC
 // ═══════════════════════════════════════════════
-// ═══════════════════════════════════════════════
-//  ZOHO TOKEN REFRESH — ALL IN ONE HTML
-//  Uses Supabase RPC (pg_net) as server-side proxy
-//  No external files needed
-// ═══════════════════════════════════════════════
+async function refreshTokenNow() {
+  const btn = document.getElementById('refresh-now-btn');
+  const clientId = LS.get('zoho-client-id');
+  const secret = LS.get('zoho-client-secret');
+  const refresh = LS.get('zoho-refresh-token');
 
-// The SQL to run once in Supabase to enable server-side token refresh
-const ZOHO_REFRESH_SQL = `
--- Enable pg_net extension (allows HTTP calls from Supabase)
-CREATE EXTENSION IF NOT EXISTS pg_net;
+  if (!clientId || !refresh) return alert("Please set Zoho credentials first");
 
--- Create zoho_tokens table to store the latest access token
-CREATE TABLE IF NOT EXISTS zoho_tokens (
-  id           INTEGER PRIMARY KEY DEFAULT 1,
-  access_token TEXT NOT NULL DEFAULT '',
-  expires_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at   TIMESTAMPTZ DEFAULT NOW()
-);
-ALTER TABLE zoho_tokens ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "Public read" ON zoho_tokens;
-DROP POLICY IF EXISTS "Anon write" ON zoho_tokens;
-CREATE POLICY "Public read" ON zoho_tokens FOR SELECT USING (true);
-CREATE POLICY "Anon write" ON zoho_tokens FOR ALL USING (true) WITH CHECK (true);
+  btn.innerText = "Refreshing...";
+  try {
+    // Note: In a production environment, this fetch should go through your Supabase Edge Function 
+    // to avoid CORS issues and keep secrets safe.
+    const dc = document.getElementById('api-datacenter').value.split('|')[0];
+    const res = await fetch(`${dc}/oauth/v2/token?refresh_token=${refresh}&client_id=${clientId}&client_secret=${secret}&grant_type=refresh_token`, { method: 'POST' });
+    const data = await res.json();
 
--- Insert default row
-INSERT INTO zoho_tokens (id, access_token, expires_at)
-VALUES (1, '', NOW())
-ON CONFLICT (id) DO NOTHING;
-
--- Create the RPC function that calls Zoho and saves the token
-CREATE OR REPLACE FUNCTION refresh_zoho_token(
-  p_refresh_token TEXT,
-  p_client_id     TEXT,
-  p_client_secret TEXT
-) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER AS $$
-DECLARE
-  v_response      JSONB;
-  v_access_token  TEXT;
-  v_expires_in    INT;
-  v_request_id    BIGINT;
-  v_result        JSONB;
-BEGIN
-  -- Make HTTP POST to Zoho using pg_net
-  SELECT net.http_post(
-    url := 'https://accounts.zoho.in/oauth/v2/token',
-    headers := '{"Content-Type": "application/x-www-form-urlencoded"}'::JSONB,
-    body := ('grant_type=refresh_token&refresh_token=' || p_refresh_token ||
-             '&client_id=' || p_client_id ||
-             '&client_secret=' || p_client_secret)::TEXT
-  ) INTO v_request_id;
-
-  -- Wait briefly for response
-  PERFORM pg_sleep(2);
-
-  -- Get response
-  SELECT response_body::JSONB INTO v_response
-  FROM net._http_response
-  WHERE id = v_request_id;
-
-  IF v_response IS NULL THEN
-    RETURN jsonb_build_object('error', 'No response from Zoho');
-  END IF;
-
-  v_access_token := v_response->>'access_token';
-  v_expires_in   := COALESCE((v_response->>'expires_in')::INT, 3600);
-
-  IF v_access_token IS NULL THEN
-    RETURN jsonb_build_object('error', v_response->>'error', 'error_description', v_response->>'error_description');
-  END IF;
-
-  -- Save token to zoho_tokens table
-  INSERT INTO zoho_tokens (id, access_token, expires_at, updated_at)
-  VALUES (1, v_access_token, NOW() + (v_expires_in || ' seconds')::INTERVAL, NOW())
-  ON CONFLICT (id) DO UPDATE
-    SET access_token = EXCLUDED.access_token,
-        expires_at   = EXCLUDED.expires_at,
-        updated_at   = NOW();
-
-  RETURN jsonb_build_object(
-    'access_token', v_access_token,
-    'expires_in',   v_expires_in,
-    'saved',        true
-  );
-END;
-$$;`;
-
-function setupZohoRefreshFunction() {
-  // Show the SQL in a modal for the user to copy and run
-  const existing = document.getElementById('setup-sql-modal');
-  if (existing) existing.remove();
-
-  const modal = document.createElement('div');
-  modal.id = 'setup-sql-modal';
-  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:1rem';
-  modal.innerHTML = `
-    <div style="background:var(--surface);border-radius:16px;padding:2rem;width:100%;max-width:680px;border:1px solid var(--border);max-height:90vh;overflow-y:auto">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-        <div style="font-family:'DM Serif Display',serif;font-size:18px">Setup Supabase DB Function</div>
-        <button onclick="document.getElementById('setup-sql-modal').remove()" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:13px">✕ Close</button>
-      </div>
-      <div style="font-size:13px;color:var(--ink2);margin-bottom:1rem;line-height:1.6">
-        Run this SQL <strong>once</strong> in your Supabase Dashboard → SQL Editor. It installs a server-side function that refreshes your Zoho token without any CORS issues.
-      </div>
-      <pre id="setup-sql-pre" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-size:11px;overflow:auto;white-space:pre-wrap;color:var(--ink2);max-height:360px">${ZOHO_REFRESH_SQL.trim()}</pre>
-      <div style="display:flex;gap:8px;margin-top:1rem">
-        <button onclick="copySql()" class="btn-sm accent" style="flex:1">Copy SQL</button>
-        <a href="https://supabase.com/dashboard/project/lrccotdkoptqwehvsbvk/sql/new" target="_blank" class="btn-sm" style="flex:1;text-align:center;text-decoration:none">Open SQL Editor ↗</a>
-      </div>
-      <div style="margin-top:10px;font-size:11px;color:var(--ink3)">After running the SQL, come back and click <strong>↺ Refresh Now</strong> — the token will be generated and saved to Supabase automatically.</div>
-    </div>`;
-  document.body.appendChild(modal);
-}
-
-function copySql() {
-  navigator.clipboard.writeText(ZOHO_REFRESH_SQL.trim())
-    .then(() => toast('SQL copied to clipboard!'))
-    .catch(() => toast('Copy failed — please select and copy manually.'));
-}
-let tokenRefreshTimer=null, timerTickInterval=null;
-
-function getZohoCreds(){
-  const dc = (LS.getJSON('zoho_api_config')||{}).datacenter||'https://accounts.zoho.in|https://www.zohoapis.in';
-  return {
-    refreshToken: LS.get('zoho_refresh_token')||'',
-    clientId:     LS.get('zoho_client_id')||'',
-    clientSecret: LS.get('zoho_client_secret')||'',
-    accountsUrl:  dc.split('|')[0]
-  };
-}
-
-const REFRESH_MS = 29 * 60 * 1000;
-
-async function refreshTokenNow(){
-  const btn=document.getElementById('refresh-now-btn');
-  const {refreshToken,clientId,clientSecret}=getZohoCreds();
-  if(!refreshToken||!clientId||!clientSecret){
-    toast('Enter Refresh Token, Client ID and Secret first.');
-    switchTab('settings'); return;
-  }
-  btn.disabled=true; btn.textContent='↺ Refreshing…';
-  addLog('Requesting new access token…','info');
-
-  // Strategy 1: Supabase RPC using pg_net (server-side, no CORS, works everywhere)
-  if(SB_URL && SB_KEY){
-    try{
-      const res=await fetch(`${SB_URL}/rest/v1/rpc/refresh_zoho_token`,{
-        method:'POST',
-        headers:{
-          'apikey':SB_KEY,
-          'Authorization':`Bearer ${SB_KEY}`,
-          'Content-Type':'application/json'
-        },
-        body:JSON.stringify({
-          p_refresh_token: refreshToken,
-          p_client_id:     clientId,
-          p_client_secret: clientSecret
-        })
-      });
-      const data=await res.json();
-      if(data && data.access_token){
-        await saveAccessToken(data.access_token, data.expires_in||3600);
-        addLog(`Token refreshed via Supabase RPC. Expires ${Math.round((data.expires_in||3600)/60)} min. Saved to DB ✓`,'ok');
-        toast('Token refreshed & saved to Supabase.');
-        btn.disabled=false; btn.textContent='↺ Refresh Token';
-        return;
-      } else if(data && data.error){
-        addLog(`Zoho error via RPC: ${data.error}`,'err');
-      } else {
-        addLog('RPC function not found — click ⚙ Setup DB Function first.','err');
-      }
-    } catch(e){ addLog(`Supabase RPC error: ${e.message}`,'err'); }
-  }
-
-  // Strategy 2: Vercel proxy /api/refresh-token (works when hosted on Vercel)
-  const onVercel = window.location.hostname!=='localhost' && window.location.protocol!=='file:';
-  if(onVercel){
-    try{
-      const res=await fetch('/api/refresh-token',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({
-          refresh_token:refreshToken,
-          client_id:clientId,
-          client_secret:clientSecret,
-          sb_url:SB_URL,
-          sb_key:SB_KEY
-        })
-      });
-      const data=await res.json();
-      if(data.access_token){
-        await saveAccessToken(data.access_token, data.expires_in||3600);
-        addLog(`Token refreshed via Vercel proxy. Expires ${Math.round((data.expires_in||3600)/60)} min.`,'ok');
-        toast('Access token refreshed & saved to Supabase.');
-        btn.disabled=false; btn.textContent='↺ Refresh Token';
-        return;
-      } else {
-        addLog(`Zoho error: ${data.error} — ${data.error_description||''}`,'err');
-        setZohoStatus('off','Refresh failed');
-        toast(`Token refresh failed: ${data.error}`);
-        btn.disabled=false; btn.textContent='↺ Refresh Token';
-        return;
-      }
-    } catch(e){ addLog(`Vercel proxy error: ${e.message}. Trying fallback…`,'err'); }
-  }
-
-  // Strategy 3: Direct call (may work if Zoho allows CORS for this domain)
-  try{
-    const params=new URLSearchParams({
-      grant_type:'refresh_token',
-      refresh_token:refreshToken,
-      client_id:clientId,
-      client_secret:clientSecret
-    });
-    const res=await fetch('https://accounts.zoho.in/oauth/v2/token',{
-      method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:params.toString()
-    });
-    const data=await res.json();
-    if(data.access_token){
-      await saveAccessToken(data.access_token, data.expires_in||3600);
-      addLog(`Token refreshed directly. Expires ${Math.round((data.expires_in||3600)/60)} min.`,'ok');
-      toast('Access token refreshed.');
-      btn.disabled=false; btn.textContent='↺ Refresh Token';
-      return;
+    if (data.access_token) {
+      LS.set('zoho-access-token', data.access_token);
+      LS.set('zoho-token-time', Date.now());
+      document.getElementById('access-token-preview').innerText = data.access_token;
+      showToast("Token Refreshed");
+      startTokenTimer();
+    } else {
+      throw new Error(data.error || 'Unknown error');
     }
-  } catch(e){ addLog(`Direct call blocked (CORS): ${e.message}`,'err'); }
-
-  // Strategy 4: Manual fallback
-  addLog('Auto-refresh unavailable. Please enter token manually below.','err');
-  showManualTokenBox(refreshToken, clientId, clientSecret);
-  btn.disabled=false; btn.textContent='↺ Refresh Token';
-}
-
-function scheduleNextRefresh(){
-  if(tokenRefreshTimer) clearTimeout(tokenRefreshTimer);
-  tokenRefreshTimer=setTimeout(()=>{
-    addLog('Auto-refresh triggered (29 min)','info');
-    refreshTokenNow();
-  }, REFRESH_MS);
-  startTimerTick();
-}
-
-function stopTimers(){
-  if(tokenRefreshTimer){clearTimeout(tokenRefreshTimer);tokenRefreshTimer=null;}
-  if(timerTickInterval){clearInterval(timerTickInterval);timerTickInterval=null;}
-}
-
-function startTimerTick(){
-  if(timerTickInterval) clearInterval(timerTickInterval);
-  timerTickInterval=setInterval(updateTimerUI,1000);
-  updateTimerUI();
-}
-
-function updateTimerUI(){
-  const timer=document.getElementById('token-timer');
-  const dot=document.getElementById('timer-dot');
-  const text=document.getElementById('timer-text');
-  const exp=parseInt(LS.get('zoho_token_expires_at')||'0');
-  if(!exp){ timer.className='token-timer'; dot.className='timer-dot'; text.textContent='Token not set'; return; }
-  const sec=Math.max(0,Math.round((exp-Date.now())/1000));
-  const m=Math.floor(sec/60), s=sec%60;
-  text.textContent=sec>0?`Token: ${m}m ${String(s).padStart(2,'0')}s`:'Token expired';
-  if(sec===0){ timer.className='token-timer expired'; dot.className='timer-dot expired'; setZohoStatus('off','Expired'); }
-  else if(sec<300){ timer.className='token-timer warn'; dot.className='timer-dot warn'; }
-  else { timer.className='token-timer ok'; dot.className='timer-dot ok'; }
-}
-
-function addLog(msg,type='info'){
-  const log=document.getElementById('refresh-log');
-  const now=new Date().toLocaleTimeString();
-  const el=document.createElement('div');
-  el.className=`log-entry log-${type}`;
-  el.textContent=`[${now}] ${msg}`;
-  if(log.children.length===1 && log.children[0].textContent.includes('No events')) log.innerHTML='';
-  log.insertBefore(el,log.firstChild);
-  while(log.children.length>25) log.removeChild(log.lastChild);
-}
-
-async function saveAccessToken(token, expiresIn){
-  LS.set('zoho_access_token', token);
-  const exp = Date.now()+((expiresIn||3600)*1000);
-  LS.set('zoho_token_expires_at', exp.toString());
-  updateAccessTokenPreview(token);
-  setZohoStatus('ok','Token active');
-  scheduleNextRefresh();
-
-  // Also save to Supabase so faq.html always gets the latest token
-  if(SB_URL && SB_KEY){
-    try{
-      const expires_at = new Date(exp).toISOString();
-      const row = {id:1, access_token:token, expires_at, updated_at:new Date().toISOString()};
-      const headers = {
-        'apikey':SB_KEY,'Authorization':`Bearer ${SB_KEY}`,
-        'Content-Type':'application/json','Prefer':'return=minimal'
-      };
-      const patch = await fetch(`${SB_URL}/rest/v1/zoho_tokens?id=eq.1`,{method:'PATCH',headers,body:JSON.stringify(row)});
-      if(patch.status===404||patch.status===406){
-        await fetch(`${SB_URL}/rest/v1/zoho_tokens`,{method:'POST',headers,body:JSON.stringify(row)});
-      }
-      addLog('Token saved to Supabase ✓','ok');
-    } catch(e){
-      addLog(`Supabase save failed: ${e.message}`,'err');
-    }
+  } catch (e) {
+    alert("Token Refresh Failed: " + e.message);
+  } finally {
+    btn.innerText = "↺ Refresh Now";
   }
 }
 
-function showManualTokenBox(rt, ci, cs){
-  // Remove existing box if any
-  const existing = document.getElementById('manual-token-box');
-  if(existing) existing.remove();
-
-  // Build the curl command so user can run it in terminal
-  const curlCmd = `curl -X POST https://accounts.zoho.in/oauth/v2/token \\\n  -d "grant_type=refresh_token" \\\n  -d "refresh_token=${rt}" \\\n  -d "client_id=${ci}" \\\n  -d "client_secret=${cs}"`;
-
-  const box = document.createElement('div');
-  box.id = 'manual-token-box';
-  box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:1rem';
-  box.innerHTML = `
-    <div style="background:var(--surface);border-radius:16px;padding:2rem;width:100%;max-width:580px;border:1px solid var(--border)">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.25rem">
-        <div style="font-family:'DM Serif Display',serif;font-size:18px">Paste Access Token</div>
-        <div onclick="document.getElementById('manual-token-box').remove()" style="cursor:pointer;font-size:20px;color:var(--ink3)">✕</div>
-      </div>
-      <p style="font-size:13px;color:var(--ink2);margin-bottom:1rem;line-height:1.7">
-        Since the browser blocks direct Zoho calls, run this command in your <strong>terminal / command prompt</strong> to get a fresh access token, then paste it below:
-      </p>
-      <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:11px;color:var(--ink2);white-space:pre;overflow:auto;margin-bottom:1rem">${curlCmd}</div>
-      <button onclick="navigator.clipboard.writeText(\`${curlCmd.replace(/\\/g,'\\\\')}\`).then(()=>alert('Copied!'))" style="font-size:12px;padding:6px 14px;border:1.5px solid var(--border);border-radius:7px;background:var(--bg);cursor:pointer;margin-bottom:1.25rem;font-family:'DM Sans',sans-serif">Copy Command</button>
-      <label style="font-size:11px;font-weight:500;color:var(--ink3);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:6px">Paste access_token value here</label>
-      <input id="manual-at-input" type="text" placeholder="Paste the access_token value from the response…"
-        style="width:100%;padding:10px 12px;font-size:13px;font-family:'DM Sans',sans-serif;border:1.5px solid var(--border);border-radius:8px;background:var(--bg);color:var(--ink);outline:none;margin-bottom:1rem">
-      <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button onclick="document.getElementById('manual-token-box').remove()" style="padding:9px 16px;font-size:13px;font-family:'DM Sans',sans-serif;border:1.5px solid var(--border);border-radius:8px;background:var(--surface);cursor:pointer">Cancel</button>
-        <button onclick="applyManualToken()" style="padding:9px 16px;font-size:13px;font-family:'DM Sans',sans-serif;border:none;border-radius:8px;background:var(--accent);color:white;cursor:pointer;font-weight:500">Save Token</button>
-      </div>
-    </div>`;
-  document.body.appendChild(box);
-}
-
-function applyManualToken(){
-  const val = document.getElementById('manual-at-input').value.trim();
-  if(!val){ toast('Paste the access token first.'); return; }
-  saveAccessToken(val, 3600);
-  document.getElementById('manual-token-box').remove();
-  addLog('Manual access token saved. Valid for ~1 hour.','ok');
-  toast('Access token saved successfully.');
-}
-  const el=document.getElementById('access-token-preview');
-  el.textContent=token ? token.substring(0,12)+'•••••••••••••••••••••'+token.slice(-8) : 'Not generated yet';
-}
-
-function setZohoStatus(s,t){
-  document.getElementById('zoho-status-pill').className=`status-pill ${s}`;
-  document.getElementById('zoho-dot').className=`sdot ${s}`;
-  document.getElementById('zoho-status-text').textContent=t;
-}
-
 // ═══════════════════════════════════════════════
-//  SETTINGS SAVE / LOAD
+//  UI HELPERS
 // ═══════════════════════════════════════════════
-function saveZohoCredentials(){
-  const rt=document.getElementById('refresh-token-input').value.trim();
-  const ci=document.getElementById('zoho-client-id').value.trim();
-  const cs=document.getElementById('zoho-client-secret').value.trim();
-  if(!rt||!ci||!cs){ toast('All three fields are required.'); return; }
-  LS.set('zoho_refresh_token',rt);
-  LS.set('zoho_client_id',ci);
-  LS.set('zoho_client_secret',cs);
-  updateSettingsAlert();
-  toast('Credentials saved — refreshing token now…');
-  refreshTokenNow();
+function openModal(id = null) {
+  const m = document.getElementById('modal-overlay');
+  m.classList.add('open');
+  if (id) {
+    const a = articles.find(x => x.id === id);
+    document.getElementById('edit-id').value = a.id;
+    document.getElementById('f-question').value = a.question;
+    document.getElementById('f-answer').value = a.answer;
+    document.getElementById('f-topic').value = a.topic;
+    document.getElementById('f-role').value = a.role;
+    document.getElementById('f-photo-url').value = a.photo_url || '';
+  } else {
+    document.getElementById('edit-id').value = '';
+    document.querySelectorAll('.modal input, .modal textarea').forEach(i => i.value = '');
+  }
 }
 
-function clearZohoCredentials(){
-  if(!confirm('Clear all Zoho credentials? Lead lookup will stop working.')) return;
-  ['zoho_refresh_token','zoho_client_id','zoho_client_secret','zoho_access_token','zoho_token_expires_at'].forEach(k=>LS.del(k));
-  stopTimers();
-  ['refresh-token-input','zoho-client-id','zoho-client-secret'].forEach(id=>document.getElementById(id).value='');
-  updateAccessTokenPreview('');
-  setZohoStatus('off','No token');
-  updateTimerUI();
-  updateSettingsAlert();
-  toast('Zoho credentials cleared.');
+function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.innerText = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
 }
 
-function saveApiConfig(){
-  const cfg={
-    datacenter:    document.getElementById('api-datacenter').value,
-    customerField: document.getElementById('api-customerfield').value.trim()||'Customer_ID',
-    dateFrom:      document.getElementById('api-datefrom').value||'2025-10-15',
-    expiredField:  document.getElementById('api-expiredfield').value.trim()||'Expired'
-  };
-  LS.setJSON('zoho_api_config',cfg);
-  toast('API config saved.');
-}
-
-function toggleField(id,btn){
-  const el=document.getElementById(id);
-  if(el.type==='password'){ el.type='text'; btn.textContent='Hide'; }
-  else { el.type='password'; btn.textContent='Show'; }
-}
-
-function updateSettingsAlert(){
-  const missing=!LS.get('zoho_refresh_token')||!LS.get('sb_url');
-  document.getElementById('settings-alert').style.display=missing?'inline-block':'none';
-}
-
-// ═══════════════════════════════════════════════
-//  INIT
-// ═══════════════════════════════════════════════
-const DEFAULT_SB_URL = 'https://lrccotdkoptqwehvsbvk.supabase.co';
-const DEFAULT_SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxyY2NvdGRrb3B0cXdlaHZzYnZrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU2NDcyNjMsImV4cCI6MjA5MTIyMzI2M30.Za9MeR-E_W-x_7_eIGe6ZsQPDvMhBFN1SLlEcHRQPz4';
-
-function initSettings(){
-  // Always use defaults — overwrite whatever is stored
-  SB_URL = DEFAULT_SB_URL;
-  SB_KEY = DEFAULT_SB_KEY;
-  LS.set('sb_url', DEFAULT_SB_URL);
-  LS.set('sb_key', DEFAULT_SB_KEY);
-
-  // Fill fields so user can see what is being used
-  document.getElementById('sb-url').value = SB_URL;
-  document.getElementById('sb-key').value = SB_KEY;
-  setSbStatus('ok', 'Connected');
-
-  document.getElementById('refresh-token-input').value=LS.get('zoho_refresh_token')||'';
-  document.getElementById('zoho-client-id').value=LS.get('zoho_client_id')||'';
-  document.getElementById('zoho-client-secret').value=LS.get('zoho_client_secret')||'';
-
-  const at=LS.get('zoho_access_token')||'';
-  updateAccessTokenPreview(at);
-  const exp=parseInt(LS.get('zoho_token_expires_at')||'0');
-  if(at&&exp>Date.now()){ setZohoStatus('ok','Token active'); scheduleNextRefresh(); }
-  else if(at&&LS.get('zoho_refresh_token')){ setZohoStatus('warn','Refreshing…'); refreshTokenNow(); }
-
-  const cfg=LS.getJSON('zoho_api_config')||{};
-  if(cfg.datacenter) document.getElementById('api-datacenter').value=cfg.datacenter;
-  document.getElementById('api-customerfield').value=cfg.customerField||'Customer_ID';
-  document.getElementById('api-datefrom').value=cfg.dateFrom||'2025-10-15';
-  document.getElementById('api-expiredfield').value=cfg.expiredField||'Expired';
-
-  updateSettingsAlert();
-}
-
-async function init(){ initSettings(); await loadFAQsFromDB(); }
-
-// ═══════════════════════════════════════════════
-//  TABS
-// ═══════════════════════════════════════════════
-function switchTab(tab){
-  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn, .tab-panel').forEach(el => el.classList.remove('active'));
   document.getElementById(`tab-${tab}-btn`).classList.add('active');
   document.getElementById(`tab-${tab}`).classList.add('active');
 }
 
-// ═══════════════════════════════════════════════
-//  SUMMARY + TABLE
-// ═══════════════════════════════════════════════
-function renderSummary(){
-  const total=faqs.length, agents=faqs.filter(f=>f.role==='agent').length;
-  const leads=faqs.filter(f=>f.role==='lead').length, both=faqs.filter(f=>f.role==='both').length;
-  const photos=faqs.filter(f=>f.photo).length;
-  document.getElementById('summary-row').innerHTML=`
-    <div class="sum-card"><div class="sum-num">${total}</div><div class="sum-label">Total Articles</div></div>
-    <div class="sum-card"><div class="sum-num" style="color:var(--accent)">${agents}</div><div class="sum-label">Agent Only</div></div>
-    <div class="sum-card"><div class="sum-num" style="color:var(--green)">${leads}</div><div class="sum-label">Team Lead Only</div></div>
-    <div class="sum-card"><div class="sum-num" style="color:var(--purple)">${both}</div><div class="sum-label">Shared</div></div>
-    <div class="sum-card"><div class="sum-num">${photos}</div><div class="sum-label">With Photos</div></div>`;
-}
-
-const topicLabels={leads:'Leads & Contacts',users:'User & Roles',data:'Data & Fields'};
-function renderTable(){
-  const q=document.getElementById('admin-search').value.toLowerCase();
-  const role=document.getElementById('filter-role').value;
-  const topic=document.getElementById('filter-topic').value;
-  const tbody=document.getElementById('faq-tbody');
-  const filtered=faqs.filter(f=>{
-    if(role&&f.role!==role) return false;
-    if(topic&&f.topic!==topic) return false;
-    if(q&&!f.q.toLowerCase().includes(q)&&!f.a.toLowerCase().includes(q)) return false;
-    return true;
+function loadConfig() {
+  // Pull from LocalStorage into inputs
+  ['sb-url', 'sb-key', 'zoho-client-id', 'zoho-client-secret', 'refresh-token-input'].forEach(id => {
+    const val = LS.get(id);
+    if(val) document.getElementById(id).value = val;
   });
-  if(!filtered.length){ tbody.innerHTML=`<tr><td colspan="5"><div class="empty-state">No articles match your filters.</div></td></tr>`; return; }
-  tbody.innerHTML=filtered.map(f=>`
-    <tr>
-      <td>${f.photo?`<img class="thumb" src="${f.photo}" alt="" onerror="this.style.display='none'">`:`<div class="no-thumb">—</div>`}</td>
-      <td class="td-question"><div class="q-text">${f.q}</div></td>
-      <td><span class="topic-pill">${topicLabels[f.topic]||f.topic}</span></td>
-      <td><span class="role-pill pill-${f.role}">${f.role==='agent'?'Agent':f.role==='lead'?'Team Lead':'Both'}</span></td>
-      <td class="td-actions">
-        <button class="btn-icon" onclick="editArticle(${f.id})">Edit</button>
-        <button class="btn-icon del" onclick="deleteArticle(${f.id})">Delete</button>
-      </td>
-    </tr>`).join('');
 }
-
-// ═══════════════════════════════════════════════
-//  MODAL
-// ═══════════════════════════════════════════════
-function openModal(id){
-  editingId=id||null;
-  document.getElementById('modal-title').textContent=id?'Edit Article':'New Article';
-  ['f-question','f-answer','f-photo','f-photo-url'].forEach(i=>document.getElementById(i).value='');
-  document.getElementById('f-photo-file').value='';
-  document.getElementById('f-topic').value='leads';
-  document.getElementById('f-role').value='both';
-  setPhotoPreview('');
-  if(id){
-    const f=faqs.find(x=>x.id===id);
-    if(f){
-      document.getElementById('f-question').value=f.q;
-      document.getElementById('f-answer').value=f.a;
-      document.getElementById('f-topic').value=f.topic;
-      document.getElementById('f-role').value=f.role;
-      document.getElementById('f-photo').value=f.photo||'';
-      if(f.photo){ document.getElementById('f-photo-url').value=f.photo.startsWith('data:')?'':f.photo; setPhotoPreview(f.photo); }
-    }
-  }
-  document.getElementById('modal-overlay').classList.add('open');
-}
-function editArticle(id){ openModal(id); }
-function closeModal(){ document.getElementById('modal-overlay').classList.remove('open'); }
-function setPhotoPreview(src){ document.getElementById('photo-preview').innerHTML=src?`<img src="${src}" alt="preview">`:'<span>No photo selected</span>'; }
-function handlePhotoUpload(input){
-  const file=input.files[0]; if(!file) return;
-  const r=new FileReader();
-  r.onload=e=>{ document.getElementById('f-photo').value=e.target.result; document.getElementById('f-photo-url').value=''; setPhotoPreview(e.target.result); };
-  r.readAsDataURL(file);
-}
-function handlePhotoURL(input){
-  const url=input.value.trim();
-  document.getElementById('f-photo').value=url;
-  document.getElementById('f-photo-file').value='';
-  setPhotoPreview(url);
-}
-
-async function saveArticle(){
-  const q=document.getElementById('f-question').value.trim();
-  const a=document.getElementById('f-answer').value.trim();
-  const topic=document.getElementById('f-topic').value;
-  const role=document.getElementById('f-role').value;
-  const photo=document.getElementById('f-photo').value.trim();
-  if(!q||!a){ toast('Question and answer are required.'); return; }
-  const btn=document.getElementById('save-article-btn');
-  btn.disabled=true; btn.textContent='Saving…';
-  try {
-    if(editingId){
-      // UPDATE existing
-      if(SB_URL&&SB_KEY) await sbFetch(`faqs?id=eq.${editingId}`,{method:'PATCH',body:JSON.stringify(faqToRow({q,a,topic,role,photo})),headers:{'Prefer':'return=minimal'}});
-      const idx=faqs.findIndex(f=>f.id===editingId);
-      if(idx>-1) faqs[idx]={...faqs[idx],q,a,topic,role,photo};
-    } else {
-      // INSERT new — never send id, let Supabase BIGSERIAL handle it
-      if(SB_URL&&SB_KEY){
-        const res=await sbFetch('faqs',{method:'POST',body:JSON.stringify([faqToRow({q,a,topic,role,photo})])});
-        const newId=res?.[0]?.id || Date.now();
-        faqs.push({id:newId,topic,role,q,a,photo});
-      } else {
-        const newId=faqs.length?Math.max(...faqs.map(f=>f.id))+1:1;
-        faqs.push({id:newId,topic,role,q,a,photo});
-      }
-    }
-    syncToLocalStorage();
-    // Reload from Supabase to get fresh IDs
-    await loadFAQsFromDB();
-    closeModal();
-    toast(editingId?'Article updated.':'New article added.');
-  } catch(e){ toast(`Save failed: ${e.message}`); }
-  btn.disabled=false; btn.textContent='Save Article';
-}
-
-async function deleteArticle(id){
-  if(!confirm('Delete this article? This cannot be undone.')) return;
-  try {
-    if(SB_URL&&SB_KEY) await sbFetch(`faqs?id=eq.${id}`,{method:'DELETE',headers:{'Prefer':'return=minimal'}});
-    faqs=faqs.filter(f=>f.id!==id);
-    syncToLocalStorage();
-    renderSummary(); renderTable();
-    toast('Article deleted.');
-  } catch(e){ toast(`Delete failed: ${e.message}`); }
-}
-
-// ═══════════════════════════════════════════════
-//  EXPORT + TOAST
-// ═══════════════════════════════════════════════
-function exportJSON(){
-  const blob=new Blob([JSON.stringify(faqs,null,2)],{type:'application/json'});
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob); a.download='zoho_crm_faqs.json'; a.click();
-  toast('JSON exported.');
-}
-function toast(msg){
-  const t=document.getElementById('toast');
-  t.textContent=msg; t.classList.add('show');
-  setTimeout(()=>t.classList.remove('show'),3200);
-}
+</script>
 </script>
 </body>
 </html>
