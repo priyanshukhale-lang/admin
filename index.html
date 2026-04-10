@@ -652,13 +652,17 @@ async function runSupabaseMigration() {
 
 async function forceSyncToSupabase() {
   if (!SB_URL||!SB_KEY) { toast('Connect Supabase first.'); return; }
+  if (!confirm('This will delete all Supabase data and re-insert from local. Continue?')) return;
   setSyncBar('syncing',`Pushing ${faqs.length} articles to Supabase…`);
   try {
-    // upsert all
-    const rows = faqs.map(f=>({ id:f.id, topic:f.topic, role:f.role, question:f.q, answer:f.a, photo:f.photo||'' }));
-    await sbFetch('faqs', { method:'POST', body:JSON.stringify(rows), headers:{'Prefer':'resolution=merge-duplicates,return=minimal'} });
+    // Delete all first to avoid conflicts
+    await sbFetch('faqs?id=gt.0',{method:'DELETE',headers:{'Prefer':'return=minimal'}});
+    // Re-insert without IDs
+    const rows = faqs.map(f=>({topic:f.topic,role:f.role,question:f.q,answer:f.a,photo:f.photo||''}));
+    await sbFetch('faqs',{method:'POST',body:JSON.stringify(rows),headers:{'Prefer':'return=minimal'}});
     setSyncBar('success',`Pushed ${faqs.length} articles to Supabase.`);
     toast('Sync complete.');
+    await loadFAQsFromDB();
   } catch(e) { setSyncBar('error',`Sync failed: ${e.message}`); }
 }
 
@@ -692,7 +696,10 @@ const DEFAULT_FAQS = [
 let faqs=[], editingId=null;
 
 function rowToFaq(r){ return {id:r.id,topic:r.topic,role:r.role,q:r.question,a:r.answer,photo:r.photo||''}; }
-function faqToRow(f){ return {topic:f.topic,role:f.role,question:f.q,answer:f.a,photo:f.photo||''}; }
+function faqToRow(f){ 
+  // Never include id — let Supabase BIGSERIAL auto-generate
+  return {topic:f.topic, role:f.role, question:f.q, answer:f.a, photo:f.photo||''}; 
+}
 
 function syncToLocalStorage(){
   LS.setJSON('zoho_faqs', faqs.map(f=>({id:f.id,topic:f.topic,role:f.role,q:f.q,a:f.a,photo:f.photo})));
