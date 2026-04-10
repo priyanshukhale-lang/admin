@@ -1034,19 +1034,24 @@ async function saveArticle(){
   btn.disabled=true; btn.textContent='Saving…';
   try {
     if(editingId){
+      // UPDATE existing
       if(SB_URL&&SB_KEY) await sbFetch(`faqs?id=eq.${editingId}`,{method:'PATCH',body:JSON.stringify(faqToRow({q,a,topic,role,photo})),headers:{'Prefer':'return=minimal'}});
       const idx=faqs.findIndex(f=>f.id===editingId);
       if(idx>-1) faqs[idx]={...faqs[idx],q,a,topic,role,photo};
     } else {
-      let newId;
+      // INSERT new — never send id, let Supabase BIGSERIAL handle it
       if(SB_URL&&SB_KEY){
         const res=await sbFetch('faqs',{method:'POST',body:JSON.stringify([faqToRow({q,a,topic,role,photo})])});
-        newId=res?.[0]?.id||(faqs.length?Math.max(...faqs.map(f=>f.id))+1:1);
-      } else { newId=faqs.length?Math.max(...faqs.map(f=>f.id))+1:1; }
-      faqs.push({id:newId,topic,role,q,a,photo});
+        const newId=res?.[0]?.id || Date.now();
+        faqs.push({id:newId,topic,role,q,a,photo});
+      } else {
+        const newId=faqs.length?Math.max(...faqs.map(f=>f.id))+1:1;
+        faqs.push({id:newId,topic,role,q,a,photo});
+      }
     }
     syncToLocalStorage();
-    renderSummary(); renderTable();
+    // Reload from Supabase to get fresh IDs
+    await loadFAQsFromDB();
     closeModal();
     toast(editingId?'Article updated.':'New article added.');
   } catch(e){ toast(`Save failed: ${e.message}`); }
