@@ -942,17 +942,26 @@ async function refreshTokenNow(){
           p_client_secret: clientSecret
         })
       });
-      const data=await res.json();
-      if(data && data.access_token){
+      const text = await res.text();
+      addLog(`RPC raw response (${res.status}): ${text.substring(0,120)}`,'info');
+      let data;
+      try { data = JSON.parse(text); } catch(e){ data = null; }
+
+      if(res.status === 404 || (text && text.includes('Could not find'))){
+        addLog('RPC not found — run the SQL from ⚙ Setup DB Function first.','err');
+      } else if(data && data.access_token){
         await saveAccessToken(data.access_token, data.expires_in||3600);
-        addLog(`Token refreshed via Supabase RPC. Expires ${Math.round((data.expires_in||3600)/60)} min. Saved to DB ✓`,'ok');
+        addLog(`✓ Token refreshed via Supabase RPC. Expires ${Math.round((data.expires_in||3600)/60)} min. Saved ✓`,'ok');
         toast('Token refreshed & saved to Supabase.');
         btn.disabled=false; btn.textContent='↺ Refresh Token';
         return;
       } else if(data && data.error){
-        addLog(`Zoho error via RPC: ${data.error}`,'err');
+        addLog(`Zoho error: ${data.error}${data.error_description?' — '+data.error_description:''}`,'err');
+        toast(`Zoho error: ${data.error}`);
+        btn.disabled=false; btn.textContent='↺ Refresh Token';
+        return;
       } else {
-        addLog('RPC function not found — click ⚙ Setup DB Function first.','err');
+        addLog(`Unexpected RPC response: ${text.substring(0,100)}`,'err');
       }
     } catch(e){ addLog(`Supabase RPC error: ${e.message}`,'err'); }
   }
